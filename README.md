@@ -4,6 +4,8 @@ A collection of scripts and tools for Qlik Sense administrators and developers, 
 
 All tools are read-only unless explicitly stated otherwise. They are designed for **client-managed Qlik Sense** environments (i.e. on-premises deployments, not Qlik Cloud).
 
+![Analysis of repository database bloat](client-managed/powershell/repo-db-optimize/docs/img/qs-toolbox-repo-db-bloat-group-1.png)
+
 ## ❤️ Support the project
 
 If you find this project helpful and use it in your Qlik Sense environment, please consider supporting it financially! Your sponsorship helps ensure the project's long-term sustainability and allows me to continue maintaining it, fixing bugs, and adding new features.
