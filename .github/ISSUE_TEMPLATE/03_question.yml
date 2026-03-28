@@ -1,0 +1,18 @@
+name: "\u2753 Question"
+description: Ask a question about using or contributing to qs-toolbox-public
+labels: 'template: question'
+body:
+  - type: markdown
+    attributes:
+      value: Thanks! Please provide details so we can answer your question quickly.
+  - type: input
+    attributes:
+      label: What is your question?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Details
+      description: Provide any relevant context, commands you ran, or links to files.
+    validations:
+      required: false

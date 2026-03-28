@@ -1,0 +1,65 @@
+name: "\U0001F41E Bug Report"
+description: Create a bug report for qs-toolbox-public
+labels: 'template: bug'
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug report! Please fill out this form as completely as possible.
+  - type: markdown
+    attributes:
+      value: 'Please first search the repository for similar issues and discussions.'
+  - type: dropdown
+    attributes:
+      label: Which area of the repo does this affect?
+      options:
+        - powershell
+        - apps
+        - docs
+        - other
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Which file or script is affected?
+      description: 'Provide a path (for example: client-managed/powershell/repo-db-optimize/script.ps1)'
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: What OS are you running?
+      description: 'For example: Windows 11, macOS 13, Ubuntu 22.04'
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: What PowerShell version are you using (if applicable)?
+      description: 'For example: PowerShell 7.3.0 or Windows PowerShell 5.1'
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior. Include commands and expected vs actual output.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Logs or Error Output
+      description: Paste relevant log lines or error messages (redact secrets).
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: Before posting, confirm the steps are repeatable and include info needed to reproduce the issue.
