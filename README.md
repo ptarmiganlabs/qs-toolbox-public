@@ -14,7 +14,7 @@ If you find this project helpful and use it in your Qlik Sense environment, plea
 
 * ⭐ **Star the repository** on GitHub - it helps others discover the project
 * 🍴 **Fork and contribute** - pull requests are welcome!
-* 💬 **Share your feedback** - let me know how you're using it
+* 💬 **Share your feedback** - let us know how you're using it
 * 🐛 **Report issues** - help improve stability and functionality
 
 *This project is maintained by [Göran Sander](https://github.com/mountaindude) and supported by [Ptarmigan Labs](https://ptarmiganlabs.com).*
