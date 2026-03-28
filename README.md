@@ -4,11 +4,24 @@ A collection of scripts and tools for Qlik Sense administrators and developers, 
 
 All tools are read-only unless explicitly stated otherwise. They are designed for **client-managed Qlik Sense** environments (i.e. on-premises deployments, not Qlik Cloud).
 
+## ❤️ Support the project
+
+If you find this project helpful and use it in your Qlik Sense environment, please consider supporting it financially! Your sponsorship helps ensure the project's long-term sustainability and allows me to continue maintaining it, fixing bugs, and adding new features.
+
+**👉 [Sponsor the project on GitHub](https://github.com/sponsors/ptarmiganlabs)** - Click the "Sponsor" button at the repository page to become a sponsor.
+
+* ⭐ **Star the repository** on GitHub - it helps others discover the project
+* 🍴 **Fork and contribute** - pull requests are welcome!
+* 💬 **Share your feedback** - let me know how you're using it
+* 🐛 **Report issues** - help improve stability and functionality
+
+*This project is maintained by [Göran Sander](https://github.com/mountaindude) and supported by [Ptarmigan Labs](https://ptarmiganlabs.com).*
+
 ---
 
 ## Repository layout
 
-```
+```text
 qs-toolbox-public/
 └── client-managed/
     └── powershell/
@@ -26,7 +39,7 @@ New tool sets are added as sibling folders under `client-managed/powershell/` (o
 PowerShell scripts for read-only analysis of the Qlik Sense repository PostgreSQL database. Useful for understanding database health, table sizes, user counts, and group membership patterns.
 
 | Script | Description |
-|---|---|
+| --- | --- |
 | `repo-db-overview.ps1` | Comprehensive database overview: table sizes, row counts, indexes, user permissions |
 | `user-group-memberships.ps1` | User group membership analysis: statistics, histograms, rankings, and bloat detection |
 
