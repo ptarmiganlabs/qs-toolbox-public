@@ -14,6 +14,8 @@
 
 The script is read-only and does not modify the repository database, but queries may have a minor performance impact; run during maintenance windows or off-peak hours.
 
+The group relevance/bloat analysis (`-RelevantGroups`) is computed efficiently: it loads one row per distinct group (not one row per membership) and uses a single CTE-based SQL query for user-level breakdowns, keeping both memory usage and database round-trips low regardless of the number of users or memberships.
+
 ## Requirements
 
 - PowerShell: PowerShell Core 6.0+ (cross-platform)

@@ -1115,36 +1115,40 @@ function Format-GroupDetail {
 
 <#
 .SYNOPSIS
-    Retrieves all group names and their per-user membership rows for relevance
-    classification.
+    Retrieves aggregated group data: one row per distinct group with row count
+    and distinct user count.
 
 .DESCRIPTION
-    Returns every (GroupName, UserDirectory, UserId) tuple from UserAttributes
-    where AttributeType = 'Group'. The caller classifies groups as relevant
-    or bloat using the RelevantGroups substring patterns.
+    Queries the UserAttributes table to produce a per-group summary: the number
+    of membership rows (COUNT(*)) and distinct users (COUNT(DISTINCT User_ID))
+    for each distinct group. This is an efficient alternative to loading all
+    individual membership rows and is used as the basis for the relevance/bloat
+    analysis.
 
 .OUTPUTS
-    [PSCustomObject[]] — Each object has: GroupName, UserDirectory, UserId.
+    [PSCustomObject[]] — Each object has: GroupName (string), RowCount (int64),
+    UserCount (int64). Sorted by UserCount descending. Returns an empty array
+    on failure.
 #>
-function Get-AllGroupMembershipRows {
-    Write-Log -Level "INFO" -Message "Retrieving all group membership rows for relevance analysis"
+function Get-GroupSummaries {
+    Write-Log -Level "INFO" -Message "Retrieving aggregated group summary data"
 
     $query = @"
 SELECT
     ua."AttributeValue" AS group_name,
-    u."UserDirectory",
-    u."UserId"
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT ua."User_ID") AS user_count
 FROM public."UserAttributes" ua
-JOIN public."Users" u ON u."ID" = ua."User_ID"
 WHERE ua."AttributeType" = 'Group'
-ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
+GROUP BY ua."AttributeValue"
+ORDER BY user_count DESC;
 "@
 
     $result = Invoke-PsqlQuery -Query $query
 
     $items = @()
     if ($LASTEXITCODE -ne 0 -or -not $result) {
-        Write-Log -Level "WARN" -Message "Failed to retrieve group membership rows"
+        Write-Log -Level "WARN" -Message "Failed to retrieve group summary data"
         return $items
     }
 
@@ -1155,13 +1159,121 @@ ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
         $parts = $line -split '\|'
         if ($parts.Length -ge 3) {
             $items += [PSCustomObject]@{
-                GroupName     = $parts[0].Trim()
-                UserDirectory = $parts[1].Trim()
-                UserId        = $parts[2].Trim()
+                GroupName = $parts[0].Trim()
+                RowCount  = [int64]$parts[1].Trim()
+                UserCount = [int64]$parts[2].Trim()
             }
         }
     }
+
+    Write-Log -Level "DEBUG" -Message "Retrieved $($items.Count) group summaries"
     return $items
+}
+
+<#
+.SYNOPSIS
+    Computes per-user group membership breakdown using a single SQL query.
+
+.DESCRIPTION
+    Given two lists of group names (relevant and bloat), constructs a CTE-based
+    SQL query that classifies each user as having relevant groups, bloat groups,
+    both, or neither. All five user counts are returned in a single database
+    round-trip.
+
+    Handles the case where either list is empty by substituting a FALSE condition
+    for that category, ensuring correct zero-counts without invalid SQL.
+
+.PARAMETER RelevantGroupNames
+    Array of group name strings classified as relevant (may be empty).
+
+.PARAMETER BloatGroupNames
+    Array of group name strings classified as bloat (may be empty).
+
+.OUTPUTS
+    [PSCustomObject] with UsersWithRelevant, UsersWithBloat, UsersOnlyRelevant,
+    UsersOnlyBloat, UsersBoth (all int64). Returns zeros on failure.
+#>
+function Get-UserGroupBreakdown {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$RelevantGroupNames,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$BloatGroupNames
+    )
+
+    $zero = [PSCustomObject]@{
+        UsersWithRelevant = [int64]0
+        UsersWithBloat    = [int64]0
+        UsersOnlyRelevant = [int64]0
+        UsersOnlyBloat    = [int64]0
+        UsersBoth         = [int64]0
+    }
+
+    if ($RelevantGroupNames.Count -eq 0 -and $BloatGroupNames.Count -eq 0) {
+        return $zero
+    }
+
+    # Build SQL IN lists — group names come from the DB; single-quote escaping is used
+    # because psql CLI does not support parameterized queries.  Values sourced from
+    # the same database are trusted, but escaping prevents accidental breakage from
+    # group names that contain apostrophes (e.g. "O'Brien").
+    $relevantIn = if ($RelevantGroupNames.Count -gt 0) {
+        ($RelevantGroupNames | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ","
+    } else { $null }
+
+    $bloatIn = if ($BloatGroupNames.Count -gt 0) {
+        ($BloatGroupNames | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ","
+    } else { $null }
+
+    # Use FALSE when a category has no groups so the CTE condition is always valid SQL
+    $relevantCond = if ($relevantIn) { "ua.`"AttributeValue`" IN ($relevantIn)" } else { "FALSE" }
+    $bloatCond    = if ($bloatIn)    { "ua.`"AttributeValue`" IN ($bloatIn)" }    else { "FALSE" }
+
+    $query = @"
+WITH user_classes AS (
+    SELECT
+        ua."User_ID",
+        MAX(CASE WHEN $relevantCond THEN 1 ELSE 0 END) AS has_relevant,
+        MAX(CASE WHEN $bloatCond THEN 1 ELSE 0 END) AS has_bloat
+    FROM public."UserAttributes" ua
+    WHERE ua."AttributeType" = 'Group'
+    GROUP BY ua."User_ID"
+)
+SELECT
+    COALESCE(SUM(CASE WHEN has_relevant = 1 THEN 1 ELSE 0 END), 0) AS users_with_relevant,
+    COALESCE(SUM(CASE WHEN has_bloat = 1 THEN 1 ELSE 0 END), 0) AS users_with_bloat,
+    COALESCE(SUM(CASE WHEN has_relevant = 1 AND has_bloat = 0 THEN 1 ELSE 0 END), 0) AS users_only_relevant,
+    COALESCE(SUM(CASE WHEN has_bloat = 1 AND has_relevant = 0 THEN 1 ELSE 0 END), 0) AS users_only_bloat,
+    COALESCE(SUM(CASE WHEN has_relevant = 1 AND has_bloat = 1 THEN 1 ELSE 0 END), 0) AS users_both
+FROM user_classes;
+"@
+
+    Write-Log -Level "INFO" -Message "Computing user group breakdown ($($RelevantGroupNames.Count) relevant, $($BloatGroupNames.Count) bloat groups)"
+
+    $result = Invoke-PsqlQuery -Query $query
+
+    if ($LASTEXITCODE -ne 0 -or -not $result) {
+        Write-Log -Level "WARN" -Message "Failed to compute user group breakdown"
+        return $zero
+    }
+
+    $text = if ($result -is [array]) { ($result -join "`n").Trim() } else { $result.ToString().Trim() }
+    $parts = $text -split '\|'
+    if ($parts.Length -ge 5) {
+        return [PSCustomObject]@{
+            UsersWithRelevant = [int64]$parts[0].Trim()
+            UsersWithBloat    = [int64]$parts[1].Trim()
+            UsersOnlyRelevant = [int64]$parts[2].Trim()
+            UsersOnlyBloat    = [int64]$parts[3].Trim()
+            UsersBoth         = [int64]$parts[4].Trim()
+        }
+    }
+
+    Write-Log -Level "WARN" -Message "Unexpected user group breakdown result format: '$text'"
+    return $zero
 }
 
 <#
@@ -1169,18 +1281,21 @@ ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
     Classifies groups as relevant or bloat and computes metrics.
 
 .DESCRIPTION
-    Given the list of all group membership rows and the user-supplied relevance
-    patterns, classifies each distinct group as "relevant" (its name contains
-    at least one pattern as a case-insensitive substring) or "bloat".
+    Given the user-supplied relevance patterns, classifies each distinct group
+    as "relevant" (its name contains at least one pattern as a case-insensitive
+    substring) or "bloat".
+
+    Uses SQL-level aggregation for efficiency:
+    - Loads one row per distinct group (via Get-GroupSummaries) rather than
+      one row per membership, regardless of database size.
+    - Delegates user-level breakdowns to a single CTE-based SQL query
+      (via Get-UserGroupBreakdown) instead of scanning all rows client-side.
 
     Returns an analysis object with:
     - Patterns used
     - Relevant/bloat group lists with user counts
     - Summary counts: total groups, relevant/bloat groups, total/relevant/bloat
       membership rows, users with relevant groups, users with only bloat
-
-.PARAMETER AllRows
-    Array from Get-AllGroupMembershipRows.
 
 .PARAMETER Patterns
     String array of case-insensitive substring patterns.
@@ -1189,13 +1304,10 @@ ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
     Total user count (for percentage calculations).
 
 .OUTPUTS
-    [PSCustomObject] with analysis results.
+    [PSCustomObject] with analysis results, or $null if no group data is found.
 #>
 function Get-RelevanceAnalysis {
     param(
-        [Parameter(Mandatory = $true)]
-        [array]$AllRows,
-
         [Parameter(Mandatory = $true)]
         [string[]]$Patterns,
 
@@ -1203,27 +1315,22 @@ function Get-RelevanceAnalysis {
         [int64]$TotalUsers
     )
 
-    Write-Log -Level "INFO" -Message "Classifying groups using patterns: $($Patterns -join ', ')"
+    Write-Log -Level "INFO" -Message "Running relevance analysis using patterns: $($Patterns -join ', ')"
 
-    # Build distinct group -> user-count map
-    $groupUsers = @{}
-    $userRelevant = @{}   # userId -> $true if has relevant group
-    $userBloat    = @{}   # userId -> $true if has bloat group
+    # Step 1: Get per-group aggregates from the database (one row per distinct group)
+    $groupSummaries = Get-GroupSummaries
 
-    foreach ($row in $AllRows) {
-        $gn = $row.GroupName
-        if (-not $groupUsers.ContainsKey($gn)) {
-            $groupUsers[$gn] = New-Object System.Collections.Generic.HashSet[string]
-        }
-        $userKey = "$($row.UserDirectory)\$($row.UserId)"
-        [void]$groupUsers[$gn].Add($userKey)
+    if ($groupSummaries.Count -eq 0) {
+        Write-Log -Level "WARN" -Message "No group data found for relevance analysis"
+        return $null
     }
 
-    # Classify each group
+    # Step 2: Classify each group using the supplied patterns
     $relevantGroups = @()
-    $bloatGroups = @()
+    $bloatGroups    = @()
 
-    foreach ($gn in ($groupUsers.Keys | Sort-Object)) {
+    foreach ($gs in $groupSummaries) {
+        $gn = $gs.GroupName
         $isRelevant = $false
         foreach ($pat in $Patterns) {
             if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
@@ -1232,49 +1339,46 @@ function Get-RelevanceAnalysis {
             }
         }
 
-        $userCount = $groupUsers[$gn].Count
         $obj = [PSCustomObject]@{
             GroupName = $gn
-            UserCount = $userCount
+            UserCount = $gs.UserCount
             Category  = if ($isRelevant) { "Relevant" } else { "Bloat" }
         }
 
-        if ($isRelevant) {
-            $relevantGroups += $obj
-            foreach ($uk in $groupUsers[$gn]) { $userRelevant[$uk] = $true }
-        } else {
-            $bloatGroups += $obj
-            foreach ($uk in $groupUsers[$gn]) { $userBloat[$uk] = $true }
-        }
+        if ($isRelevant) { $relevantGroups += $obj } else { $bloatGroups += $obj }
     }
 
     # Sort by user count descending
     $relevantGroups = $relevantGroups | Sort-Object -Property UserCount -Descending
     $bloatGroups    = $bloatGroups    | Sort-Object -Property UserCount -Descending
 
-    $totalGroups       = $relevantGroups.Count + $bloatGroups.Count
-    $totalRows         = $AllRows.Count
-    $relevantRows      = ($AllRows | Where-Object {
-        $gn = $_.GroupName
-        $isRel = $false
+    # Step 3: Compute row counts from the per-group RowCount field — no second pass through all rows
+    $totalRows    = [int64]($groupSummaries | Measure-Object -Property RowCount -Sum).Sum
+    $relevantRows = [int64]0
+    foreach ($gs in $groupSummaries) {
+        $gn = $gs.GroupName
         foreach ($pat in $Patterns) {
             if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $isRel = $true; break
+                $relevantRows += $gs.RowCount
+                break
             }
         }
-        $isRel
-    }).Count
-    $bloatRows         = $totalRows - $relevantRows
-    $usersWithRelevant = $userRelevant.Count
-    $usersWithBloat    = $userBloat.Count
-    $usersOnlyBloat    = ($userBloat.Keys | Where-Object { -not $userRelevant.ContainsKey($_) }).Count
-    $usersOnlyRelevant = ($userRelevant.Keys | Where-Object { -not $userBloat.ContainsKey($_) }).Count
-    $usersBoth         = ($userRelevant.Keys | Where-Object { $userBloat.ContainsKey($_) }).Count
-    $usersNoGroups     = $TotalUsers - ($userRelevant.Keys + $userBloat.Keys | Sort-Object -Unique).Count
+    }
+    $bloatRows = $totalRows - $relevantRows
+
+    # Step 4: Get user-level breakdown via a single CTE SQL query
+    $relevantGroupNames = @($relevantGroups | ForEach-Object { $_.GroupName })
+    $bloatGroupNames    = @($bloatGroups    | ForEach-Object { $_.GroupName })
+
+    $breakdown = Get-UserGroupBreakdown `
+        -RelevantGroupNames $relevantGroupNames `
+        -BloatGroupNames    $bloatGroupNames
+
+    $usersNoGroups = $TotalUsers - ($breakdown.UsersWithRelevant + $breakdown.UsersWithBloat - $breakdown.UsersBoth)
 
     return [PSCustomObject]@{
         Patterns           = $Patterns
-        TotalGroups        = $totalGroups
+        TotalGroups        = $relevantGroups.Count + $bloatGroups.Count
         RelevantGroupCount = $relevantGroups.Count
         BloatGroupCount    = $bloatGroups.Count
         RelevantGroups     = $relevantGroups
@@ -1283,11 +1387,11 @@ function Get-RelevanceAnalysis {
         RelevantRows       = $relevantRows
         BloatRows          = $bloatRows
         TotalUsers         = $TotalUsers
-        UsersWithRelevant  = $usersWithRelevant
-        UsersWithBloat     = $usersWithBloat
-        UsersOnlyRelevant  = $usersOnlyRelevant
-        UsersOnlyBloat     = $usersOnlyBloat
-        UsersBoth          = $usersBoth
+        UsersWithRelevant  = $breakdown.UsersWithRelevant
+        UsersWithBloat     = $breakdown.UsersWithBloat
+        UsersOnlyRelevant  = $breakdown.UsersOnlyRelevant
+        UsersOnlyBloat     = $breakdown.UsersOnlyBloat
+        UsersBoth          = $breakdown.UsersBoth
         UsersNoGroups      = $usersNoGroups
     }
 }
@@ -1515,15 +1619,13 @@ function Main {
         $normalizedPatterns = @($RelevantGroups | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_.Trim() })
         if ($normalizedPatterns.Count -gt 0) {
             Write-Log -Level "INFO" -Message "Running relevance analysis"
-            $allMembershipRows = Get-AllGroupMembershipRows
-            if ($allMembershipRows -and $allMembershipRows.Count -gt 0) {
-                $analysis = Get-RelevanceAnalysis `
-                    -AllRows $allMembershipRows `
-                    -Patterns $normalizedPatterns `
-                    -TotalUsers $summary.TotalUsers
+            $analysis = Get-RelevanceAnalysis `
+                -Patterns $normalizedPatterns `
+                -TotalUsers $summary.TotalUsers
+            if ($analysis) {
                 $outputSections += Format-RelevanceAnalysis -Analysis $analysis
             } else {
-                Write-Log -Level "WARN" -Message "No group membership rows found for relevance analysis"
+                Write-Log -Level "WARN" -Message "No group data found for relevance analysis"
             }
         }
 

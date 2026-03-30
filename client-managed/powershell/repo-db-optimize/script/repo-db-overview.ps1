@@ -320,13 +320,19 @@ function Get-TableRowCountsExact {
 
 <#
 .SYNOPSIS
-    Retrieves index statistics for the given tables.
+    Retrieves index statistics for all user tables in a single query.
 
 .DESCRIPTION
-    For each table, queries pg_index/pg_class to list indexes and their sizes.
+    Queries pg_index/pg_class joined with pg_stat_user_tables to list all
+    indexes and their sizes for every user table. All index data is retrieved
+    in a single database round-trip rather than one query per table.
+
+    If the Tables parameter is provided, the result is filtered to only the
+    tables present in that list.
 
 .PARAMETER Tables
-    Array of table objects (from Get-TableStatistics).
+    Array of table objects (from Get-TableStatistics). When supplied, only
+    indexes belonging to these tables are returned.
 
 .OUTPUTS
     [PSCustomObject[]] — Each object has: TableName, IndexName, SizePretty, SizeBytes.
@@ -339,53 +345,52 @@ function Get-IndexStatistics {
 
     Write-Log -Level "INFO" -Message "Retrieving index statistics"
 
-    $indexes = @()
-
-    foreach ($table in $Tables) {
-        $tableName = $table.TableName.Trim()
-
-        $parts = $tableName -split '\.'
-        if ($parts.Length -ne 2) {
-            Write-Log -Level "WARN" -Message "Unexpected table name format for indexes: $tableName; skipping"
-            continue
-        }
-
-        $schema = $parts[0].Replace("'","''")
-        $rel = $parts[1].Replace("'","''")
-
-        $query = @"
+    $query = @"
 SELECT
-    i.relname as index_name,
-    pg_size_pretty(pg_relation_size(i.oid)) as index_size_pretty,
-    pg_relation_size(i.oid) as index_size_bytes
+    n.nspname || '.' || t.relname AS table_name,
+    i.relname AS index_name,
+    pg_size_pretty(pg_relation_size(i.oid)) AS index_size_pretty,
+    pg_relation_size(i.oid) AS index_size_bytes
 FROM pg_class t
 JOIN pg_index x ON t.oid = x.indrelid
 JOIN pg_class i ON i.oid = x.indexrelid
-WHERE t.relname = '$rel'
-  AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '$schema')
-ORDER BY pg_relation_size(i.oid) DESC;
+JOIN pg_namespace n ON t.relnamespace = n.oid
+JOIN pg_stat_user_tables s ON s.relid = t.oid
+ORDER BY n.nspname, t.relname, pg_relation_size(i.oid) DESC;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            $rows = $(if ($result -is [array]) { $result } else { $result -split "`n" })
-            foreach ($line in $rows) {
-                $line = $line.Trim()
-                if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)$") {
-                    $indexes += [PSCustomObject]@{
-                        TableName   = $tableName
-                        IndexName   = $matches[1].Trim()
-                        SizePretty  = $matches[2].Trim()
-                        SizeBytes   = [int64]$matches[3].Trim()
-                    }
-                } else {
-                    Write-Log -Level "DEBUG" -Message ("Skipping unparsable index line for {0}: '{1}'" -f $tableName, $line)
-                }
+    $indexes = @()
+    if ($LASTEXITCODE -ne 0 -or -not $result) {
+        Write-Log -Level "WARN" -Message "Failed to retrieve index statistics"
+        return $indexes
+    }
+
+    # Build a lookup set of table names to filter results when Tables is provided
+    $tableSet = @{}
+    foreach ($t in $Tables) { $tableSet[$t.TableName.Trim()] = $true }
+
+    $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+    foreach ($line in $rows) {
+        $line = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
+            $tbl = $matches[1].Trim()
+            if ($tableSet.Count -gt 0 -and -not $tableSet.ContainsKey($tbl)) { continue }
+            $indexes += [PSCustomObject]@{
+                TableName  = $tbl
+                IndexName  = $matches[2].Trim()
+                SizePretty = $matches[3].Trim()
+                SizeBytes  = [int64]$matches[4].Trim()
             }
+        } else {
+            Write-Log -Level "DEBUG" -Message "Skipping unparsable index line: '$line'"
         }
     }
 
+    $distinctTableCount = ($indexes | Select-Object -ExpandProperty TableName -Unique | Measure-Object).Count
+    Write-Log -Level "DEBUG" -Message "Retrieved $($indexes.Count) index entries across $distinctTableCount tables"
     return $indexes
 }
 

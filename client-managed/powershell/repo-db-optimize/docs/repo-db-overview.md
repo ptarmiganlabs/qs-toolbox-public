@@ -27,7 +27,7 @@ The script is read-only but can execute expensive queries (COUNT(*)) when run in
 
 - Table statistics: estimated row counts (`pg_stat_user_tables`) and sizes
 - Optional exact row counts (COUNT(*)) with safeguards (timeout + sampling limit)
-- Index statistics per table
+- Index statistics for all user tables retrieved in a single query
 - Roles and permissions (uses `pg_roles`, `pg_class`, `pg_namespace`, `pg_auth_members`)
 - Stepwise debug mode (`-StepDebug`) with `-StopAfter` stages to inspect intermediate outputs
 - Output to console and optional file export
