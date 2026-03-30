@@ -11,7 +11,7 @@ PowerShell scripts for read-only analysis of a Qlik Sense (client-managed) repos
 
 | Requirement | Version |
 |---|---|
-| PowerShell | Core 6.0+ (cross-platform) |
+| PowerShell | Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform) |
 | PostgreSQL client (`psql`) | 12+ |
 | Network access | to the PostgreSQL host on the configured port |
 

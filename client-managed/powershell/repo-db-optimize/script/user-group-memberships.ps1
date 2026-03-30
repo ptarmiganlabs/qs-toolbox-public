@@ -14,7 +14,7 @@
 # The script is READ-ONLY and does NOT modify the repository database.
 #
 # Requirements:
-# - PowerShell Core 6.0+ (cross-platform)
+# - Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 # - PostgreSQL client tools (psql) version 12+
 #
 # Usage:
@@ -44,7 +44,7 @@
 # Version: 1.0.0
 #===============================================================================
 
-#requires -version 6.0
+#requires -version 5.0
 
 #-------------------------------------------------------------------------------
 # WARNING: PERFORMANCE IMPACT DISCLAIMER
@@ -1213,7 +1213,7 @@ function Get-RelevanceAnalysis {
     foreach ($row in $AllRows) {
         $gn = $row.GroupName
         if (-not $groupUsers.ContainsKey($gn)) {
-            $groupUsers[$gn] = [System.Collections.Generic.HashSet[string]]::new()
+            $groupUsers[$gn] = New-Object System.Collections.Generic.HashSet[string]
         }
         $userKey = "$($row.UserDirectory)\$($row.UserId)"
         [void]$groupUsers[$gn].Add($userKey)

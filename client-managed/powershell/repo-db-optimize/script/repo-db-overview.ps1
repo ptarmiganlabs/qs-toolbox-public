@@ -10,7 +10,7 @@
 # No hardcoded values are used.
 #
 # Requirements:
-# - PowerShell (Windows or cross-platform)
+# - Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 # - PostgreSQL client tools (psql) version 12+
 #
 # Usage:
@@ -37,7 +37,7 @@
 # Version: 2.0.0
 #===============================================================================
 
-#requires -version 6.0
+#requires -version 5.0
 
 #-------------------------------------------------------------------------------
 # WARNING: PERFORMANCE IMPACT DISCLAIMER
@@ -369,7 +369,7 @@ ORDER BY pg_relation_size(i.oid) DESC;
         $result = Invoke-PsqlQuery -Query $query
 
         if ($LASTEXITCODE -eq 0 -and $result) {
-            $rows = $result -is [array] ? $result : ($result -split "`n")
+            $rows = $(if ($result -is [array]) { $result } else { $result -split "`n" })
             foreach ($line in $rows) {
                 $line = $line.Trim()
                 if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)$") {
