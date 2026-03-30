@@ -13,7 +13,7 @@ The script is read-only but can execute expensive queries (COUNT(*)) when run in
 
 ## Requirements
 
-- PowerShell: PowerShell Core 6.0+ (cross-platform)
+- PowerShell: Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 - PostgreSQL client: `psql` 12+ (script uses modern catalog views and functions)
 - Network: access to the PostgreSQL server from the machine running the script
 

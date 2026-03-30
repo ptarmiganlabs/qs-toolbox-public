@@ -14,11 +14,16 @@
 
 The script is read-only and does not modify the repository database, but queries may have a minor performance impact; run during maintenance windows or off-peak hours.
 
-The group relevance/bloat analysis (`-RelevantGroups`) is computed efficiently: it loads one row per distinct group (not one row per membership) and uses a single CTE-based SQL query for user-level breakdowns, keeping both memory usage and database round-trips low regardless of the number of users or memberships.
+The group relevance/bloat analysis (`-RelevantGroups`) supports two modes, controlled by `-AnalysisMode`:
+
+- **`local`** (default): Fetches data from PostgreSQL with simple GROUP BY and SELECT queries, then classifies groups and computes user breakdowns in PowerShell using hashtable-based O(n) lookups. This minimises the load on the PostgreSQL server and is recommended for production environments where the database serves active Qlik Sense workloads.
+- **`sql`**: Pushes the user-level breakdown computation to PostgreSQL via a CTE-based query. This can be faster for very large data sets but increases database load.
+
+Both modes produce identical output.
 
 ## Requirements
 
-- PowerShell: PowerShell Core 6.0+ (cross-platform)
+- PowerShell: Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 - PostgreSQL client: `psql` 12+ (script uses modern catalog views and functions)
 - Network: access to the PostgreSQL server from the machine running the script
 
@@ -97,6 +102,16 @@ Analyse group relevance / bloat with one or more substring patterns:
 .\user-group-memberships.ps1 -RelevantGroups 'admin' -RelevantGroups 'sense'
 ```
 
+Choose the analysis mode (default is `local`):
+
+```powershell
+# Local mode (default): analysis done in PowerShell, lighter on the database
+.\user-group-memberships.ps1 -RelevantGroups 'admin,sense' -AnalysisMode local
+
+# SQL mode: analysis done in PostgreSQL via CTE query (faster for very large datasets)
+.\user-group-memberships.ps1 -RelevantGroups 'admin,sense' -AnalysisMode sql
+```
+
 Export to file:
 
 ```powershell
@@ -132,6 +147,7 @@ Run StepDebug to inspect a stage and exit early:
 | `-FilterUser` | string | - | Show detail for a specific user (`DOMAIN\userId`) |
 | `-FilterGroup` | string | - | Show detail for a specific group (exact match) |
 | `-RelevantGroups` | string[] | - | Substring patterns for bloat analysis (comma-separated or repeated) |
+| `-AnalysisMode` | string | local | `local` analyses in PowerShell (lighter on DB); `sql` pushes computation to PostgreSQL |
 | `-TopN` | int | 10 | Number of top entries in summary mode |
 | `-OutputFile` | string | - | Write report to a timestamped file |
 | `-StepDebug` | switch | - | Enable stepwise debug mode |
