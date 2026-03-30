@@ -1540,7 +1540,7 @@ WHERE ua."AttributeType" = 'Group'
         if ($hb -and -not $hr) { $usersOnlyBloat++ }
     }
 
-    $usersNoGroups = $TotalUsers - ($usersWithRelevant + $usersWithBloat - $usersBoth)
+    $usersNoGroups = $TotalUsers - $userFlags.Count
 
     Write-Log -Level "DEBUG" -Message "Local analysis: $($userFlags.Count) users processed, $($relevantGroupSet.Count) relevant groups, $($bloatGroupSet.Count) bloat groups"
 
