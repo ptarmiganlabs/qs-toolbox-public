@@ -469,7 +469,8 @@ ORDER BY r.rolname;
 
 <#
 .SYNOPSIS
-    Retrieves direct object ownership and role memberships for database users.
+    Retrieves direct object ownership and role memberships for all database users
+    using batch queries (two total queries instead of two per user).
 
 .PARAMETER Users
     Array of user objects (from Get-DatabaseUsers).
@@ -488,11 +489,8 @@ function Get-UserPermissions {
 
     $permissions = @()
 
-    foreach ($user in $Users) {
-        $username = $user.Username
-
-        # Direct object ownership
-        $query = @"
+    # Batch query: all direct object ownership for all users at once
+    $query = @"
 SELECT
     n.nspname as schema_name,
     c.relname as table_name,
@@ -508,57 +506,60 @@ SELECT
 FROM pg_class c
 JOIN pg_user u ON u.usesysid = c.relowner
 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE u.usename = '$username'
-  AND c.relkind IN ('r', 'v', 'S')
-ORDER BY n.nspname, c.relname;
+WHERE c.relkind IN ('r', 'v', 'S')
+ORDER BY u.usename, n.nspname, c.relname;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            foreach ($line in $result) {
-                if ($line -match "^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$") {
-                    $permissions += [PSCustomObject]@{
-                        SchemaName   = $matches[1]
-                        TableName    = $matches[2]
-                        ObjectType   = $matches[3]
-                        Grantee      = $matches[4]
-                        GranteeID    = $matches[5]
-                        ACL          = $matches[6]
-                    }
+    if ($LASTEXITCODE -eq 0 -and $result) {
+        $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+        foreach ($line in $rows) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match "^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$") {
+                $permissions += [PSCustomObject]@{
+                    SchemaName   = $matches[1].Trim()
+                    TableName    = $matches[2].Trim()
+                    ObjectType   = $matches[3].Trim()
+                    Grantee      = $matches[4].Trim()
+                    GranteeID    = $matches[5].Trim()
+                    ACL          = $matches[6].Trim()
                 }
             }
         }
+    }
 
-        # Role memberships (inherited permissions)
-        $query = @"
+    # Batch query: all role memberships for all users at once
+    $query = @"
 SELECT
     u.usename as member_name,
     u.usesysid as member_id,
-    r.relname as role_name,
+    r.rolname as role_name,
     r.oid as role_id,
     m.admin_option
 FROM pg_auth_members m
 JOIN pg_user u ON m.member = u.usesysid
 JOIN pg_roles r ON m.roleid = r.oid
-WHERE u.usename = '$username'
-ORDER BY r.relname;
+ORDER BY u.usename, r.rolname;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            foreach ($line in $result) {
-                if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
-                    $adminOption = if ($matches[5] -eq "t") { " (with admin option)" } else { "" }
-                    $permissions += [PSCustomObject]@{
-                        SchemaName   = ""
-                        TableName    = ""
-                        ObjectType   = "ROLE_MEMBERSHIP"
-                        Grantee      = $matches[1]
-                        GranteeID    = $matches[2]
-                        ACL          = "Member of role: $($matches[3])$adminOption"
-                    }
+    if ($LASTEXITCODE -eq 0 -and $result) {
+        $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+        foreach ($line in $rows) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
+                $adminOption = if ($matches[5].Trim() -eq "t") { " (with admin option)" } else { "" }
+                $permissions += [PSCustomObject]@{
+                    SchemaName   = ""
+                    TableName    = ""
+                    ObjectType   = "ROLE_MEMBERSHIP"
+                    Grantee      = $matches[1].Trim()
+                    GranteeID    = $matches[2].Trim()
+                    ACL          = "Member of role: $($matches[3].Trim())$adminOption"
                 }
             }
         }
@@ -885,10 +886,25 @@ function Format-DatabaseSummary {
 }
 
 #-------------------------------------------------------------------------------
+# Progress Logging
+#-------------------------------------------------------------------------------
+function Write-Progress-Step {
+    param(
+        [string]$StepName,
+        [int]$StepNumber,
+        [System.Diagnostics.Stopwatch]$Stopwatch
+    )
+    $elapsed = $Stopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
+    Write-Log -Level "INFO" -Message ("Step {0}: {1} (elapsed: {2})" -f $StepNumber, $StepName, $elapsed)
+}
+
+#-------------------------------------------------------------------------------
 # Main Script
 #-------------------------------------------------------------------------------
 function Main {
     $cfg = $script:QSRConfig
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $step = 0
 
     Write-Log -Level "INFO" -Message "Starting Qlik Sense Repository Database Overview"
     Write-Log -Level "INFO" -Message "Detail Level: $DetailLevel"
@@ -914,6 +930,8 @@ function Main {
         }
     }
 
+    $step++; Write-Progress-Step -StepName "Prerequisites validated" -StepNumber $step -Stopwatch $sw
+
     # Test database connection
     if (-not (Test-DatabaseConnection)) {
         Write-Log -Level "ERROR" -Message "Cannot proceed without database connection"
@@ -923,12 +941,16 @@ function Main {
     # Check PostgreSQL version
     Test-PostgreSQLVersion | Out-Null
 
+    $step++; Write-Progress-Step -StepName "Database connection verified" -StepNumber $step -Stopwatch $sw
+
     # Get database size
     $dbSize = Get-TotalDatabaseSize
     if (-not $dbSize) {
         Write-Log -Level "ERROR" -Message "Failed to get database size"
         exit 1
     }
+
+    $step++; Write-Progress-Step -StepName "Database size retrieved" -StepNumber $step -Stopwatch $sw
 
     # Get table statistics
     $tables = Get-TableStatistics
@@ -937,16 +959,20 @@ function Main {
         exit 1
     }
 
+    $step++; Write-Progress-Step -StepName "Table statistics retrieved" -StepNumber $step -Stopwatch $sw
+
     # Get exact row counts if detailed mode
     $exactCounts = @{}
     if ($DetailLevel -eq "details") {
         $exactCounts = Get-TableRowCountsExact -Tables $tables
+        $step++; Write-Progress-Step -StepName "Exact row counts retrieved" -StepNumber $step -Stopwatch $sw
     }
 
     # Get index statistics if detailed mode
     $indexes = @()
     if ($DetailLevel -eq "details") {
         $indexes = Get-IndexStatistics -Tables $tables
+        $step++; Write-Progress-Step -StepName "Index statistics retrieved" -StepNumber $step -Stopwatch $sw
     }
 
     if ($cfg.StepDebug -and $cfg.StopAfter -eq 'indexes') {
@@ -966,6 +992,8 @@ function Main {
 
     $permissions = Get-UserPermissions -Users $users
 
+    $step++; Write-Progress-Step -StepName "User permissions retrieved" -StepNumber $step -Stopwatch $sw
+
     # Format output
     $output = @()
 
@@ -979,6 +1007,8 @@ function Main {
     $output += Format-UserPermissions -Users $users -Permissions $permissions
 
     $fullOutput = $output -join "`r`n"
+
+    $step++; Write-Progress-Step -StepName "Output formatted" -StepNumber $step -Stopwatch $sw
 
     # Output to screen
     Write-Host $fullOutput
@@ -997,6 +1027,9 @@ function Main {
     }
 
     Write-Log -Level "INFO" -Message "Qlik Sense Repository Database Overview completed successfully"
+    $sw.Stop()
+    $step++; Write-Progress-Step -StepName "Completed" -StepNumber $step -Stopwatch $sw
+    Write-Log -Level "INFO" -Message ("Total elapsed time: {0}" -f $sw.Elapsed.ToString("hh\:mm\:ss\.fff"))
     exit 0
 }
 
