@@ -922,7 +922,7 @@ function Format-DistributionHistogram {
         $gc = $bucket.GroupCount
         $uc = $bucket.UserCount
         $pct = [Math]::Round(($uc / $TotalUsers) * 100, 1)
-        $barLen = [Math]::Max([Math]::Round(($uc / $maxCount) * $BarWidth), ($uc -gt 0 ? 1 : 0))
+        $barLen = [Math]::Max([Math]::Round(($uc / $maxCount) * $BarWidth), $(if ($uc -gt 0) { 1 } else { 0 }))
         $bar = "#" * $barLen
 
         $label = if ($gc -eq 1) { "$gc group" } else { "$gc groups" }
