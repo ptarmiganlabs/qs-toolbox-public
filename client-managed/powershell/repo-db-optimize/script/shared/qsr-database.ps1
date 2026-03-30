@@ -59,7 +59,9 @@ function Invoke-PsqlQuery {
     $dbName   = $cfg.DbName
     $dbUser   = $cfg.DbUser
 
-    # Build psql arguments
+    # Build psql arguments — query is piped via stdin to avoid Windows
+    # PowerShell 5.1 stripping double-quotes from -c arguments, which
+    # breaks case-sensitive PostgreSQL table names like public."Users".
     $psqlArgs = @(
         "-h", $dbHost,
         "-p", $dbPort,
@@ -67,8 +69,7 @@ function Invoke-PsqlQuery {
         "-U", $dbUser,
         "-t",       # Tuple-only output (no headers)
         "-A",       # Unaligned output (no padding)
-        "-F", "|",  # Pipe field separator
-        "-c", $Query
+        "-F", "|"   # Pipe field separator
     )
 
     # Export password for psql if configured
@@ -78,7 +79,7 @@ function Invoke-PsqlQuery {
     Write-Log -Level "DEBUG" -Message "Invoking psql: $psqlBin with args: $($psqlArgs -join ' ') (PGPASSWORD set: $pwdSet)"
 
     try {
-        $output = & $psqlBin @psqlArgs 2>&1
+        $output = $Query | & $psqlBin @psqlArgs 2>&1
         $script:LASTEXITCODE = $LASTEXITCODE
 
         $outPreview = ""
