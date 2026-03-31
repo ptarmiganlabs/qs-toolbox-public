@@ -1734,6 +1734,7 @@ function Main {
 
     Write-Log -Level "INFO" -Message "Starting Qlik Sense Repository - User Group Memberships"
     Write-Log -Level "INFO" -Message "Detail Level: $DetailLevel"
+    Write-Log -Level "INFO" -Message "Analysis Mode: $AnalysisMode"
 
     # Validate psql exists
     Write-Log -Level "INFO" -Message "Checking for psql binary"

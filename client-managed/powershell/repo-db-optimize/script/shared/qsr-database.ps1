@@ -16,6 +16,12 @@
 # Author: Ptarmigan Labs/Göran Sander
 #===============================================================================
 
+# Ensure UTF-8 is used when reading output from native executables (e.g. psql)
+# and when piping strings to them. On Windows PowerShell 5.1 the default is the
+# system OEM codepage, which misinterprets multi-byte UTF-8 characters.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding              = [System.Text.Encoding]::UTF8
+
 <#
 .SYNOPSIS
     Executes a SQL query against PostgreSQL using the psql command-line tool.
