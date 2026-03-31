@@ -320,13 +320,19 @@ function Get-TableRowCountsExact {
 
 <#
 .SYNOPSIS
-    Retrieves index statistics for the given tables.
+    Retrieves index statistics for all user tables in a single query.
 
 .DESCRIPTION
-    For each table, queries pg_index/pg_class to list indexes and their sizes.
+    Queries pg_index/pg_class joined with pg_stat_user_tables to list all
+    indexes and their sizes for every user table. All index data is retrieved
+    in a single database round-trip rather than one query per table.
+
+    If the Tables parameter is provided, the result is filtered to only the
+    tables present in that list.
 
 .PARAMETER Tables
-    Array of table objects (from Get-TableStatistics).
+    Array of table objects (from Get-TableStatistics). When supplied, only
+    indexes belonging to these tables are returned.
 
 .OUTPUTS
     [PSCustomObject[]] — Each object has: TableName, IndexName, SizePretty, SizeBytes.
@@ -339,53 +345,52 @@ function Get-IndexStatistics {
 
     Write-Log -Level "INFO" -Message "Retrieving index statistics"
 
-    $indexes = @()
-
-    foreach ($table in $Tables) {
-        $tableName = $table.TableName.Trim()
-
-        $parts = $tableName -split '\.'
-        if ($parts.Length -ne 2) {
-            Write-Log -Level "WARN" -Message "Unexpected table name format for indexes: $tableName; skipping"
-            continue
-        }
-
-        $schema = $parts[0].Replace("'","''")
-        $rel = $parts[1].Replace("'","''")
-
-        $query = @"
+    $query = @"
 SELECT
-    i.relname as index_name,
-    pg_size_pretty(pg_relation_size(i.oid)) as index_size_pretty,
-    pg_relation_size(i.oid) as index_size_bytes
+    n.nspname || '.' || t.relname AS table_name,
+    i.relname AS index_name,
+    pg_size_pretty(pg_relation_size(i.oid)) AS index_size_pretty,
+    pg_relation_size(i.oid) AS index_size_bytes
 FROM pg_class t
 JOIN pg_index x ON t.oid = x.indrelid
 JOIN pg_class i ON i.oid = x.indexrelid
-WHERE t.relname = '$rel'
-  AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '$schema')
-ORDER BY pg_relation_size(i.oid) DESC;
+JOIN pg_namespace n ON t.relnamespace = n.oid
+JOIN pg_stat_user_tables s ON s.relid = t.oid
+ORDER BY n.nspname, t.relname, pg_relation_size(i.oid) DESC;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            $rows = $(if ($result -is [array]) { $result } else { $result -split "`n" })
-            foreach ($line in $rows) {
-                $line = $line.Trim()
-                if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)$") {
-                    $indexes += [PSCustomObject]@{
-                        TableName   = $tableName
-                        IndexName   = $matches[1].Trim()
-                        SizePretty  = $matches[2].Trim()
-                        SizeBytes   = [int64]$matches[3].Trim()
-                    }
-                } else {
-                    Write-Log -Level "DEBUG" -Message ("Skipping unparsable index line for {0}: '{1}'" -f $tableName, $line)
-                }
+    $indexes = @()
+    if ($LASTEXITCODE -ne 0 -or -not $result) {
+        Write-Log -Level "WARN" -Message "Failed to retrieve index statistics"
+        return $indexes
+    }
+
+    # Build a lookup set of table names to filter results when Tables is provided
+    $tableSet = @{}
+    foreach ($t in $Tables) { $tableSet[$t.TableName.Trim()] = $true }
+
+    $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+    foreach ($line in $rows) {
+        $line = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
+            $tbl = $matches[1].Trim()
+            if ($tableSet.Count -gt 0 -and -not $tableSet.ContainsKey($tbl)) { continue }
+            $indexes += [PSCustomObject]@{
+                TableName  = $tbl
+                IndexName  = $matches[2].Trim()
+                SizePretty = $matches[3].Trim()
+                SizeBytes  = [int64]$matches[4].Trim()
             }
+        } else {
+            Write-Log -Level "DEBUG" -Message "Skipping unparsable index line: '$line'"
         }
     }
 
+    $distinctTableCount = ($indexes | Select-Object -ExpandProperty TableName -Unique | Measure-Object).Count
+    Write-Log -Level "DEBUG" -Message "Retrieved $($indexes.Count) index entries across $distinctTableCount tables"
     return $indexes
 }
 
@@ -464,7 +469,8 @@ ORDER BY r.rolname;
 
 <#
 .SYNOPSIS
-    Retrieves direct object ownership and role memberships for database users.
+    Retrieves direct object ownership and role memberships for all database users
+    using batch queries (two total queries instead of two per user).
 
 .PARAMETER Users
     Array of user objects (from Get-DatabaseUsers).
@@ -483,11 +489,8 @@ function Get-UserPermissions {
 
     $permissions = @()
 
-    foreach ($user in $Users) {
-        $username = $user.Username
-
-        # Direct object ownership
-        $query = @"
+    # Batch query: all direct object ownership for all users at once
+    $query = @"
 SELECT
     n.nspname as schema_name,
     c.relname as table_name,
@@ -503,57 +506,60 @@ SELECT
 FROM pg_class c
 JOIN pg_user u ON u.usesysid = c.relowner
 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE u.usename = '$username'
-  AND c.relkind IN ('r', 'v', 'S')
-ORDER BY n.nspname, c.relname;
+WHERE c.relkind IN ('r', 'v', 'S')
+ORDER BY u.usename, n.nspname, c.relname;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            foreach ($line in $result) {
-                if ($line -match "^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$") {
-                    $permissions += [PSCustomObject]@{
-                        SchemaName   = $matches[1]
-                        TableName    = $matches[2]
-                        ObjectType   = $matches[3]
-                        Grantee      = $matches[4]
-                        GranteeID    = $matches[5]
-                        ACL          = $matches[6]
-                    }
+    if ($LASTEXITCODE -eq 0 -and $result) {
+        $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+        foreach ($line in $rows) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match "^([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$") {
+                $permissions += [PSCustomObject]@{
+                    SchemaName   = $matches[1].Trim()
+                    TableName    = $matches[2].Trim()
+                    ObjectType   = $matches[3].Trim()
+                    Grantee      = $matches[4].Trim()
+                    GranteeID    = $matches[5].Trim()
+                    ACL          = $matches[6].Trim()
                 }
             }
         }
+    }
 
-        # Role memberships (inherited permissions)
-        $query = @"
+    # Batch query: all role memberships for all users at once
+    $query = @"
 SELECT
     u.usename as member_name,
     u.usesysid as member_id,
-    r.relname as role_name,
+    r.rolname as role_name,
     r.oid as role_id,
     m.admin_option
 FROM pg_auth_members m
 JOIN pg_user u ON m.member = u.usesysid
 JOIN pg_roles r ON m.roleid = r.oid
-WHERE u.usename = '$username'
-ORDER BY r.relname;
+ORDER BY u.usename, r.rolname;
 "@
 
-        $result = Invoke-PsqlQuery -Query $query
+    $result = Invoke-PsqlQuery -Query $query
 
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            foreach ($line in $result) {
-                if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
-                    $adminOption = if ($matches[5] -eq "t") { " (with admin option)" } else { "" }
-                    $permissions += [PSCustomObject]@{
-                        SchemaName   = ""
-                        TableName    = ""
-                        ObjectType   = "ROLE_MEMBERSHIP"
-                        Grantee      = $matches[1]
-                        GranteeID    = $matches[2]
-                        ACL          = "Member of role: $($matches[3])$adminOption"
-                    }
+    if ($LASTEXITCODE -eq 0 -and $result) {
+        $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+        foreach ($line in $rows) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match "^([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$") {
+                $adminOption = if ($matches[5].Trim() -eq "t") { " (with admin option)" } else { "" }
+                $permissions += [PSCustomObject]@{
+                    SchemaName   = ""
+                    TableName    = ""
+                    ObjectType   = "ROLE_MEMBERSHIP"
+                    Grantee      = $matches[1].Trim()
+                    GranteeID    = $matches[2].Trim()
+                    ACL          = "Member of role: $($matches[3].Trim())$adminOption"
                 }
             }
         }
@@ -880,10 +886,25 @@ function Format-DatabaseSummary {
 }
 
 #-------------------------------------------------------------------------------
+# Progress Logging
+#-------------------------------------------------------------------------------
+function Write-Progress-Step {
+    param(
+        [string]$StepName,
+        [int]$StepNumber,
+        [System.Diagnostics.Stopwatch]$Stopwatch
+    )
+    $elapsed = $Stopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
+    Write-Log -Level "INFO" -Message ("Step {0}: {1} (elapsed: {2})" -f $StepNumber, $StepName, $elapsed)
+}
+
+#-------------------------------------------------------------------------------
 # Main Script
 #-------------------------------------------------------------------------------
 function Main {
     $cfg = $script:QSRConfig
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $step = 0
 
     Write-Log -Level "INFO" -Message "Starting Qlik Sense Repository Database Overview"
     Write-Log -Level "INFO" -Message "Detail Level: $DetailLevel"
@@ -909,6 +930,8 @@ function Main {
         }
     }
 
+    $step++; Write-Progress-Step -StepName "Prerequisites validated" -StepNumber $step -Stopwatch $sw
+
     # Test database connection
     if (-not (Test-DatabaseConnection)) {
         Write-Log -Level "ERROR" -Message "Cannot proceed without database connection"
@@ -918,12 +941,16 @@ function Main {
     # Check PostgreSQL version
     Test-PostgreSQLVersion | Out-Null
 
+    $step++; Write-Progress-Step -StepName "Database connection verified" -StepNumber $step -Stopwatch $sw
+
     # Get database size
     $dbSize = Get-TotalDatabaseSize
     if (-not $dbSize) {
         Write-Log -Level "ERROR" -Message "Failed to get database size"
         exit 1
     }
+
+    $step++; Write-Progress-Step -StepName "Database size retrieved" -StepNumber $step -Stopwatch $sw
 
     # Get table statistics
     $tables = Get-TableStatistics
@@ -932,16 +959,20 @@ function Main {
         exit 1
     }
 
+    $step++; Write-Progress-Step -StepName "Table statistics retrieved" -StepNumber $step -Stopwatch $sw
+
     # Get exact row counts if detailed mode
     $exactCounts = @{}
     if ($DetailLevel -eq "details") {
         $exactCounts = Get-TableRowCountsExact -Tables $tables
+        $step++; Write-Progress-Step -StepName "Exact row counts retrieved" -StepNumber $step -Stopwatch $sw
     }
 
     # Get index statistics if detailed mode
     $indexes = @()
     if ($DetailLevel -eq "details") {
         $indexes = Get-IndexStatistics -Tables $tables
+        $step++; Write-Progress-Step -StepName "Index statistics retrieved" -StepNumber $step -Stopwatch $sw
     }
 
     if ($cfg.StepDebug -and $cfg.StopAfter -eq 'indexes') {
@@ -961,6 +992,8 @@ function Main {
 
     $permissions = Get-UserPermissions -Users $users
 
+    $step++; Write-Progress-Step -StepName "User permissions retrieved" -StepNumber $step -Stopwatch $sw
+
     # Format output
     $output = @()
 
@@ -974,6 +1007,8 @@ function Main {
     $output += Format-UserPermissions -Users $users -Permissions $permissions
 
     $fullOutput = $output -join "`r`n"
+
+    $step++; Write-Progress-Step -StepName "Output formatted" -StepNumber $step -Stopwatch $sw
 
     # Output to screen
     Write-Host $fullOutput
@@ -992,6 +1027,9 @@ function Main {
     }
 
     Write-Log -Level "INFO" -Message "Qlik Sense Repository Database Overview completed successfully"
+    $sw.Stop()
+    $step++; Write-Progress-Step -StepName "Completed" -StepNumber $step -Stopwatch $sw
+    Write-Log -Level "INFO" -Message ("Total elapsed time: {0}" -f $sw.Elapsed.ToString("hh\:mm\:ss\.fff"))
     exit 0
 }
 

@@ -14,9 +14,16 @@
 
 The script is read-only and does not modify the repository database, but queries may have a minor performance impact; run during maintenance windows or off-peak hours.
 
+The group relevance/bloat analysis (`-RelevantGroups`) supports two modes, controlled by `-AnalysisMode`:
+
+- **`local`** (default): Fetches data from PostgreSQL with simple GROUP BY and SELECT queries, then classifies groups and computes user breakdowns in PowerShell using hashtable-based O(n) lookups. This minimises the load on the PostgreSQL server and is recommended for production environments where the database serves active Qlik Sense workloads.
+- **`sql`**: Pushes the user-level breakdown computation to PostgreSQL via a CTE-based query. This can be faster for very large data sets but increases database load.
+
+Both modes produce identical output.
+
 ## Requirements
 
-- PowerShell: PowerShell Core 6.0+ (cross-platform)
+- PowerShell: Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 - PostgreSQL client: `psql` 12+ (script uses modern catalog views and functions)
 - Network: access to the PostgreSQL server from the machine running the script
 
@@ -26,6 +33,8 @@ The script is read-only and does not modify the repository database, but queries
 - User records are read from the `public."Users"` table.
 - Group memberships are read from the `public."UserAttributes"` table where `AttributeType = 'Group'`.
 - The `-FilterUser` parameter expects the `DOMAIN\userId` format (e.g. `MYCOMPANY\jdoe`), matching the `UserDirectory` and `UserId` columns in the Users table.
+- Queries are sent to `psql` via **stdin** (not the `-c` flag) to prevent Windows PowerShell 5.1 from stripping double-quotes in argument strings, which would cause PostgreSQL to lowercase case-sensitive table names like `public."Users"` and report them as not found.
+- The script sets `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 at startup, ensuring international characters in user names and group names are displayed correctly on Windows PowerShell 5.1.
 
 ## Features
 
@@ -95,6 +104,16 @@ Analyse group relevance / bloat with one or more substring patterns:
 .\user-group-memberships.ps1 -RelevantGroups 'admin' -RelevantGroups 'sense'
 ```
 
+Choose the analysis mode (default is `local`):
+
+```powershell
+# Local mode (default): analysis done in PowerShell, lighter on the database
+.\user-group-memberships.ps1 -RelevantGroups 'admin,sense' -AnalysisMode local
+
+# SQL mode: analysis done in PostgreSQL via CTE query (faster for very large datasets)
+.\user-group-memberships.ps1 -RelevantGroups 'admin,sense' -AnalysisMode sql
+```
+
 Export to file:
 
 ```powershell
@@ -130,6 +149,7 @@ Run StepDebug to inspect a stage and exit early:
 | `-FilterUser` | string | - | Show detail for a specific user (`DOMAIN\userId`) |
 | `-FilterGroup` | string | - | Show detail for a specific group (exact match) |
 | `-RelevantGroups` | string[] | - | Substring patterns for bloat analysis (comma-separated or repeated) |
+| `-AnalysisMode` | string | local | `local` analyses in PowerShell (lighter on DB); `sql` pushes computation to PostgreSQL |
 | `-TopN` | int | 10 | Number of top entries in summary mode |
 | `-OutputFile` | string | - | Write report to a timestamped file |
 | `-StepDebug` | switch | - | Enable stepwise debug mode |
@@ -260,6 +280,15 @@ psql -h $env:QSR_DB_HOST -p $env:QSR_DB_PORT -d $env:QSR_DB_NAME -U $env:QSR_DB_
 If parsing errors occur, run with `-StepDebug` and the appropriate `-StopAfter` stage to inspect raw psql outputs.
 
 Ensure the used role has read access to `public."Users"` and `public."UserAttributes"`.
+
+**Table not found errors (e.g. `relation "public.users" does not exist`):** PostgreSQL lowercases unquoted identifiers. This error means psql did not receive double-quoted table names — typically caused by argument-quoting stripping in Windows PowerShell 5.1. The script sends queries via stdin to work around this. If the error still occurs, verify that the `psql` binary in use is one that reads from stdin correctly (any standard PostgreSQL 12+ client does).
+
+**International characters appear garbled on Windows:** The script sets `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 automatically. If characters are still garbled, the PostgreSQL server may be returning data in a non-UTF-8 encoding. Set the codepage and client encoding before running the script:
+
+```powershell
+chcp 65001   # switch console to UTF-8
+$env:PGCLIENTENCODING = 'UTF8'
+```
 
 ## Related files
 

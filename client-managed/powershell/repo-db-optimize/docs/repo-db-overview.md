@@ -13,7 +13,7 @@ The script is read-only but can execute expensive queries (COUNT(*)) when run in
 
 ## Requirements
 
-- PowerShell: PowerShell Core 6.0+ (cross-platform)
+- PowerShell: Windows PowerShell 5.1+ or PowerShell Core 6.0+ (cross-platform)
 - PostgreSQL client: `psql` 12+ (script uses modern catalog views and functions)
 - Network: access to the PostgreSQL server from the machine running the script
 
@@ -27,7 +27,7 @@ The script is read-only but can execute expensive queries (COUNT(*)) when run in
 
 - Table statistics: estimated row counts (`pg_stat_user_tables`) and sizes
 - Optional exact row counts (COUNT(*)) with safeguards (timeout + sampling limit)
-- Index statistics per table
+- Index statistics for all user tables retrieved in a single query
 - Roles and permissions (uses `pg_roles`, `pg_class`, `pg_namespace`, `pg_auth_members`)
 - Stepwise debug mode (`-StepDebug`) with `-StopAfter` stages to inspect intermediate outputs
 - Output to console and optional file export
@@ -122,11 +122,12 @@ When `-OutputFile` is supplied, the script writes a timestamped file to `QSR_OUT
 
 ## Internal notes (queries & parsing)
 
-- `psql` is invoked with `-t -A -F '|'` (tuple-only, unaligned, pipe-separated) so output is stable for parsing.
+- `psql` is invoked with `-t -A -F '|'` (tuple-only, unaligned, pipe-separated) so output is stable for parsing. Queries are sent via **stdin** (not `-c`) to avoid Windows PowerShell 5.1 stripping double-quotes from command-line arguments, which would break case-sensitive table names such as `public."Users"`.
 - Table statistics use joins between `pg_stat_user_tables`, `pg_class` and `pg_namespace` and sizes use `pg_total_relation_size()`, `pg_relation_size()` and `pg_indexes_size()`.
 - Roles/users are read via `pg_roles` (script parses `rolcreatedb`, `rolsuper`, `rolcreaterole`, `rolreplication`, `rolvaliduntil`).
 - Indexes use `pg_index`/`pg_class` and `pg_relation_size(i.oid)`.
 - Exact counts execute `SET LOCAL statement_timeout = 60000; SELECT COUNT(*) FROM "schema"."table";` and parse the last non-empty psql line for the numeric result.
+- The shared database module sets `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 at load time, so international characters (e.g. names containing `ö`, `ä`, `ü`) are correctly handled on Windows PowerShell 5.1 where the default console encoding is the OEM codepage.
 
 ## Safeguards
 
@@ -152,6 +153,13 @@ If COUNT(*) calls time out or are too slow:
 - increase the per-COUNT timeout in the script if you control the environment
 
 Ensure the used role has read access to the system catalogs and tables referenced by the queries.
+
+**International characters appear garbled on Windows:** This can happen if the Windows console codepage does not match the PostgreSQL server's `client_encoding`. The script sets the PowerShell encoding to UTF-8 automatically, but if psql itself is not returning UTF-8 (e.g. the server uses `WIN1252`), the data from PostgreSQL may still be mis-encoded. In that case, set the codepage manually before running the script:
+
+```powershell
+chcp 65001   # switch console to UTF-8
+$env:PGCLIENTENCODING = 'UTF8'
+```
 
 ## Related files
 

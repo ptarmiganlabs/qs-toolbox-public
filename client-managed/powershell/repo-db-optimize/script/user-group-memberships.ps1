@@ -85,6 +85,10 @@ param(
     [string[]]$RelevantGroups = @(),
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("sql", "local")]
+    [string]$AnalysisMode = "local",
+
+    [Parameter(Mandatory = $false)]
     [string]$DB_HOST = $env:QSR_DB_HOST,
 
     [Parameter(Mandatory = $false)]
@@ -1115,36 +1119,40 @@ function Format-GroupDetail {
 
 <#
 .SYNOPSIS
-    Retrieves all group names and their per-user membership rows for relevance
-    classification.
+    Retrieves aggregated group data: one row per distinct group with row count
+    and distinct user count.
 
 .DESCRIPTION
-    Returns every (GroupName, UserDirectory, UserId) tuple from UserAttributes
-    where AttributeType = 'Group'. The caller classifies groups as relevant
-    or bloat using the RelevantGroups substring patterns.
+    Queries the UserAttributes table to produce a per-group summary: the number
+    of membership rows (COUNT(*)) and distinct users (COUNT(DISTINCT User_ID))
+    for each distinct group. This is an efficient alternative to loading all
+    individual membership rows and is used as the basis for the relevance/bloat
+    analysis.
 
 .OUTPUTS
-    [PSCustomObject[]] — Each object has: GroupName, UserDirectory, UserId.
+    [PSCustomObject[]] — Each object has: GroupName (string), RowCount (int64),
+    UserCount (int64). Sorted by UserCount descending. Returns an empty array
+    on failure.
 #>
-function Get-AllGroupMembershipRows {
-    Write-Log -Level "INFO" -Message "Retrieving all group membership rows for relevance analysis"
+function Get-GroupSummaries {
+    Write-Log -Level "INFO" -Message "Retrieving aggregated group summary data"
 
     $query = @"
 SELECT
     ua."AttributeValue" AS group_name,
-    u."UserDirectory",
-    u."UserId"
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT ua."User_ID") AS user_count
 FROM public."UserAttributes" ua
-JOIN public."Users" u ON u."ID" = ua."User_ID"
 WHERE ua."AttributeType" = 'Group'
-ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
+GROUP BY ua."AttributeValue"
+ORDER BY user_count DESC;
 "@
 
     $result = Invoke-PsqlQuery -Query $query
 
     $items = @()
     if ($LASTEXITCODE -ne 0 -or -not $result) {
-        Write-Log -Level "WARN" -Message "Failed to retrieve group membership rows"
+        Write-Log -Level "WARN" -Message "Failed to retrieve group summary data"
         return $items
     }
 
@@ -1155,32 +1163,143 @@ ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
         $parts = $line -split '\|'
         if ($parts.Length -ge 3) {
             $items += [PSCustomObject]@{
-                GroupName     = $parts[0].Trim()
-                UserDirectory = $parts[1].Trim()
-                UserId        = $parts[2].Trim()
+                GroupName = $parts[0].Trim()
+                RowCount  = [int64]$parts[1].Trim()
+                UserCount = [int64]$parts[2].Trim()
             }
         }
     }
+
+    Write-Log -Level "DEBUG" -Message "Retrieved $($items.Count) group summaries"
     return $items
 }
 
 <#
 .SYNOPSIS
-    Classifies groups as relevant or bloat and computes metrics.
+    Computes per-user group membership breakdown using a single SQL query.
 
 .DESCRIPTION
-    Given the list of all group membership rows and the user-supplied relevance
-    patterns, classifies each distinct group as "relevant" (its name contains
-    at least one pattern as a case-insensitive substring) or "bloat".
+    Given two lists of group names (relevant and bloat), constructs a CTE-based
+    SQL query that classifies each user as having relevant groups, bloat groups,
+    both, or neither. All five user counts are returned in a single database
+    round-trip.
+
+    Handles the case where either list is empty by substituting a FALSE condition
+    for that category, ensuring correct zero-counts without invalid SQL.
+
+.PARAMETER RelevantGroupNames
+    Array of group name strings classified as relevant (may be empty).
+
+.PARAMETER BloatGroupNames
+    Array of group name strings classified as bloat (may be empty).
+
+.OUTPUTS
+    [PSCustomObject] with UsersWithRelevant, UsersWithBloat, UsersOnlyRelevant,
+    UsersOnlyBloat, UsersBoth (all int64). Returns zeros on failure.
+#>
+function Get-UserGroupBreakdown {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$RelevantGroupNames,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$BloatGroupNames
+    )
+
+    $zero = [PSCustomObject]@{
+        UsersWithRelevant = [int64]0
+        UsersWithBloat    = [int64]0
+        UsersOnlyRelevant = [int64]0
+        UsersOnlyBloat    = [int64]0
+        UsersBoth         = [int64]0
+    }
+
+    if ($RelevantGroupNames.Count -eq 0 -and $BloatGroupNames.Count -eq 0) {
+        return $zero
+    }
+
+    # Build SQL IN lists — group names come from the DB; single-quote escaping is used
+    # because psql CLI does not support parameterized queries.  Values sourced from
+    # the same database are trusted, but escaping prevents accidental breakage from
+    # group names that contain apostrophes (e.g. "O'Brien").
+    $relevantIn = if ($RelevantGroupNames.Count -gt 0) {
+        ($RelevantGroupNames | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ","
+    } else { $null }
+
+    $bloatIn = if ($BloatGroupNames.Count -gt 0) {
+        ($BloatGroupNames | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ","
+    } else { $null }
+
+    # Use FALSE when a category has no groups so the CTE condition is always valid SQL
+    $relevantCond = if ($relevantIn) { "ua.`"AttributeValue`" IN ($relevantIn)" } else { "FALSE" }
+    $bloatCond    = if ($bloatIn)    { "ua.`"AttributeValue`" IN ($bloatIn)" }    else { "FALSE" }
+
+    $query = @"
+WITH user_classes AS (
+    SELECT
+        ua."User_ID",
+        MAX(CASE WHEN $relevantCond THEN 1 ELSE 0 END) AS has_relevant,
+        MAX(CASE WHEN $bloatCond THEN 1 ELSE 0 END) AS has_bloat
+    FROM public."UserAttributes" ua
+    WHERE ua."AttributeType" = 'Group'
+    GROUP BY ua."User_ID"
+)
+SELECT
+    COALESCE(SUM(CASE WHEN has_relevant = 1 THEN 1 ELSE 0 END), 0) AS users_with_relevant,
+    COALESCE(SUM(CASE WHEN has_bloat = 1 THEN 1 ELSE 0 END), 0) AS users_with_bloat,
+    COALESCE(SUM(CASE WHEN has_relevant = 1 AND has_bloat = 0 THEN 1 ELSE 0 END), 0) AS users_only_relevant,
+    COALESCE(SUM(CASE WHEN has_bloat = 1 AND has_relevant = 0 THEN 1 ELSE 0 END), 0) AS users_only_bloat,
+    COALESCE(SUM(CASE WHEN has_relevant = 1 AND has_bloat = 1 THEN 1 ELSE 0 END), 0) AS users_both
+FROM user_classes;
+"@
+
+    Write-Log -Level "INFO" -Message "Computing user group breakdown ($($RelevantGroupNames.Count) relevant, $($BloatGroupNames.Count) bloat groups)"
+
+    $result = Invoke-PsqlQuery -Query $query
+
+    if ($LASTEXITCODE -ne 0 -or -not $result) {
+        Write-Log -Level "WARN" -Message "Failed to compute user group breakdown"
+        return $zero
+    }
+
+    $text = if ($result -is [array]) { ($result -join "`n").Trim() } else { $result.ToString().Trim() }
+    $parts = $text -split '\|'
+    if ($parts.Length -ge 5) {
+        return [PSCustomObject]@{
+            UsersWithRelevant = [int64]$parts[0].Trim()
+            UsersWithBloat    = [int64]$parts[1].Trim()
+            UsersOnlyRelevant = [int64]$parts[2].Trim()
+            UsersOnlyBloat    = [int64]$parts[3].Trim()
+            UsersBoth         = [int64]$parts[4].Trim()
+        }
+    }
+
+    Write-Log -Level "WARN" -Message "Unexpected user group breakdown result format: '$text'"
+    return $zero
+}
+
+<#
+.SYNOPSIS
+    Classifies groups as relevant or bloat and computes metrics (SQL mode).
+
+.DESCRIPTION
+    Given the user-supplied relevance patterns, classifies each distinct group
+    as "relevant" (its name contains at least one pattern as a case-insensitive
+    substring) or "bloat".
+
+    This is the SQL-based approach that pushes computation to Postgres:
+    - Loads one row per distinct group (via Get-GroupSummaries) rather than
+      one row per membership, regardless of database size.
+    - Delegates user-level breakdowns to a single CTE-based SQL query
+      (via Get-UserGroupBreakdown) instead of scanning all rows client-side.
 
     Returns an analysis object with:
     - Patterns used
     - Relevant/bloat group lists with user counts
     - Summary counts: total groups, relevant/bloat groups, total/relevant/bloat
       membership rows, users with relevant groups, users with only bloat
-
-.PARAMETER AllRows
-    Array from Get-AllGroupMembershipRows.
 
 .PARAMETER Patterns
     String array of case-insensitive substring patterns.
@@ -1189,13 +1308,10 @@ ORDER BY ua."AttributeValue", u."UserDirectory", u."UserId";
     Total user count (for percentage calculations).
 
 .OUTPUTS
-    [PSCustomObject] with analysis results.
+    [PSCustomObject] with analysis results, or $null if no group data is found.
 #>
-function Get-RelevanceAnalysis {
+function Get-RelevanceAnalysisSql {
     param(
-        [Parameter(Mandatory = $true)]
-        [array]$AllRows,
-
         [Parameter(Mandatory = $true)]
         [string[]]$Patterns,
 
@@ -1203,27 +1319,22 @@ function Get-RelevanceAnalysis {
         [int64]$TotalUsers
     )
 
-    Write-Log -Level "INFO" -Message "Classifying groups using patterns: $($Patterns -join ', ')"
+    Write-Log -Level "INFO" -Message "Running relevance analysis (SQL mode) using patterns: $($Patterns -join ', ')"
 
-    # Build distinct group -> user-count map
-    $groupUsers = @{}
-    $userRelevant = @{}   # userId -> $true if has relevant group
-    $userBloat    = @{}   # userId -> $true if has bloat group
+    # Step 1: Get per-group aggregates from the database (one row per distinct group)
+    $groupSummaries = Get-GroupSummaries
 
-    foreach ($row in $AllRows) {
-        $gn = $row.GroupName
-        if (-not $groupUsers.ContainsKey($gn)) {
-            $groupUsers[$gn] = New-Object System.Collections.Generic.HashSet[string]
-        }
-        $userKey = "$($row.UserDirectory)\$($row.UserId)"
-        [void]$groupUsers[$gn].Add($userKey)
+    if ($groupSummaries.Count -eq 0) {
+        Write-Log -Level "WARN" -Message "No group data found for relevance analysis"
+        return $null
     }
 
-    # Classify each group
+    # Step 2: Classify each group using the supplied patterns
     $relevantGroups = @()
-    $bloatGroups = @()
+    $bloatGroups    = @()
 
-    foreach ($gn in ($groupUsers.Keys | Sort-Object)) {
+    foreach ($gs in $groupSummaries) {
+        $gn = $gs.GroupName
         $isRelevant = $false
         foreach ($pat in $Patterns) {
             if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
@@ -1232,19 +1343,126 @@ function Get-RelevanceAnalysis {
             }
         }
 
-        $userCount = $groupUsers[$gn].Count
         $obj = [PSCustomObject]@{
             GroupName = $gn
-            UserCount = $userCount
+            UserCount = $gs.UserCount
+            Category  = if ($isRelevant) { "Relevant" } else { "Bloat" }
+        }
+
+        if ($isRelevant) { $relevantGroups += $obj } else { $bloatGroups += $obj }
+    }
+
+    # Sort by user count descending
+    $relevantGroups = $relevantGroups | Sort-Object -Property UserCount -Descending
+    $bloatGroups    = $bloatGroups    | Sort-Object -Property UserCount -Descending
+
+    # Step 3: Compute row counts from the per-group RowCount field — no second pass through all rows
+    $totalRows    = [int64]($groupSummaries | Measure-Object -Property RowCount -Sum).Sum
+    $relevantRows = [int64]0
+    foreach ($gs in $groupSummaries) {
+        $gn = $gs.GroupName
+        foreach ($pat in $Patterns) {
+            if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $relevantRows += $gs.RowCount
+                break
+            }
+        }
+    }
+    $bloatRows = $totalRows - $relevantRows
+
+    # Step 4: Get user-level breakdown via a single CTE SQL query
+    $relevantGroupNames = @($relevantGroups | ForEach-Object { $_.GroupName })
+    $bloatGroupNames    = @($bloatGroups    | ForEach-Object { $_.GroupName })
+
+    $breakdown = Get-UserGroupBreakdown `
+        -RelevantGroupNames $relevantGroupNames `
+        -BloatGroupNames    $bloatGroupNames
+
+    $usersNoGroups = $TotalUsers - ($breakdown.UsersWithRelevant + $breakdown.UsersWithBloat - $breakdown.UsersBoth)
+
+    return [PSCustomObject]@{
+        Patterns           = $Patterns
+        TotalGroups        = $relevantGroups.Count + $bloatGroups.Count
+        RelevantGroupCount = $relevantGroups.Count
+        BloatGroupCount    = $bloatGroups.Count
+        RelevantGroups     = $relevantGroups
+        BloatGroups        = $bloatGroups
+        TotalRows          = $totalRows
+        RelevantRows       = $relevantRows
+        BloatRows          = $bloatRows
+        TotalUsers         = $TotalUsers
+        UsersWithRelevant  = $breakdown.UsersWithRelevant
+        UsersWithBloat     = $breakdown.UsersWithBloat
+        UsersOnlyRelevant  = $breakdown.UsersOnlyRelevant
+        UsersOnlyBloat     = $breakdown.UsersOnlyBloat
+        UsersBoth          = $breakdown.UsersBoth
+        UsersNoGroups      = $usersNoGroups
+    }
+}
+
+<#
+.SYNOPSIS
+    Classifies groups as relevant or bloat and computes metrics (local mode).
+
+.DESCRIPTION
+    Performs relevance analysis in PowerShell instead of pushing computation to
+    Postgres. Fetches data with simple queries and does classification and
+    user-level breakdown locally using hashtable-based O(n) lookups.
+
+.PARAMETER Patterns
+    String array of case-insensitive substring patterns.
+
+.PARAMETER TotalUsers
+    Total user count (for percentage calculations).
+
+.OUTPUTS
+    [PSCustomObject] with analysis results, or $null if no group data is found.
+#>
+function Get-RelevanceAnalysisLocal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Patterns,
+
+        [Parameter(Mandatory = $true)]
+        [int64]$TotalUsers
+    )
+
+    Write-Log -Level "INFO" -Message "Running relevance analysis (local mode) using patterns: $($Patterns -join ', ')"
+
+    # Step 1: Get per-group aggregates (same query as Get-GroupSummaries)
+    $groupSummaries = Get-GroupSummaries
+
+    if ($groupSummaries.Count -eq 0) {
+        Write-Log -Level "WARN" -Message "No group data found for relevance analysis"
+        return $null
+    }
+
+    # Step 2: Classify each group using the supplied patterns
+    $relevantGroups = @()
+    $bloatGroups    = @()
+    $relevantGroupSet = @{}
+
+    foreach ($gs in $groupSummaries) {
+        $gn = $gs.GroupName
+        $isRelevant = $false
+        foreach ($pat in $Patterns) {
+            if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $isRelevant = $true
+                break
+            }
+        }
+
+        $obj = [PSCustomObject]@{
+            GroupName = $gn
+            UserCount = $gs.UserCount
             Category  = if ($isRelevant) { "Relevant" } else { "Bloat" }
         }
 
         if ($isRelevant) {
             $relevantGroups += $obj
-            foreach ($uk in $groupUsers[$gn]) { $userRelevant[$uk] = $true }
+            $relevantGroupSet[$gn] = $true
         } else {
             $bloatGroups += $obj
-            foreach ($uk in $groupUsers[$gn]) { $userBloat[$uk] = $true }
         }
     }
 
@@ -1252,29 +1470,83 @@ function Get-RelevanceAnalysis {
     $relevantGroups = $relevantGroups | Sort-Object -Property UserCount -Descending
     $bloatGroups    = $bloatGroups    | Sort-Object -Property UserCount -Descending
 
-    $totalGroups       = $relevantGroups.Count + $bloatGroups.Count
-    $totalRows         = $AllRows.Count
-    $relevantRows      = ($AllRows | Where-Object {
-        $gn = $_.GroupName
-        $isRel = $false
-        foreach ($pat in $Patterns) {
-            if ($gn.IndexOf($pat, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $isRel = $true; break
+    # Step 3: Compute row counts from the per-group RowCount field
+    $totalRows    = [int64]($groupSummaries | Measure-Object -Property RowCount -Sum).Sum
+    $relevantRows = [int64]0
+    foreach ($gs in $groupSummaries) {
+        if ($relevantGroupSet.ContainsKey($gs.GroupName)) {
+            $relevantRows += $gs.RowCount
+        }
+    }
+    $bloatRows = $totalRows - $relevantRows
+
+    # Step 4: Fetch per-user membership rows and compute breakdown locally
+    # Build a bloat group set for O(1) lookups
+    $bloatGroupSet = @{}
+    foreach ($bg in $bloatGroups) {
+        $bloatGroupSet[$bg.GroupName] = $true
+    }
+
+    $queryUserGroups = @"
+SELECT ua."User_ID", ua."AttributeValue"
+FROM public."UserAttributes" ua
+WHERE ua."AttributeType" = 'Group'
+"@
+
+    Write-Log -Level "INFO" -Message "Fetching per-user membership rows for local analysis"
+    $result = Invoke-PsqlQuery -Query $queryUserGroups
+
+    # Build per-user flags with a single pass through the rows
+    $userFlags = @{}
+
+    if ($LASTEXITCODE -eq 0 -and $result) {
+        $rows = if ($result -is [array]) { $result } else { $result -split "`n" }
+        foreach ($line in $rows) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\|'
+            if ($parts.Length -lt 2) { continue }
+
+            $userId = $parts[0].Trim()
+            $groupName = $parts[1].Trim()
+
+            if (-not $userFlags.ContainsKey($userId)) {
+                $userFlags[$userId] = @{ HasRelevant = $false; HasBloat = $false }
+            }
+
+            if ($relevantGroupSet.ContainsKey($groupName)) {
+                $userFlags[$userId].HasRelevant = $true
+            }
+            if ($bloatGroupSet.ContainsKey($groupName)) {
+                $userFlags[$userId].HasBloat = $true
             }
         }
-        $isRel
-    }).Count
-    $bloatRows         = $totalRows - $relevantRows
-    $usersWithRelevant = $userRelevant.Count
-    $usersWithBloat    = $userBloat.Count
-    $usersOnlyBloat    = ($userBloat.Keys | Where-Object { -not $userRelevant.ContainsKey($_) }).Count
-    $usersOnlyRelevant = ($userRelevant.Keys | Where-Object { -not $userBloat.ContainsKey($_) }).Count
-    $usersBoth         = ($userRelevant.Keys | Where-Object { $userBloat.ContainsKey($_) }).Count
-    $usersNoGroups     = $TotalUsers - ($userRelevant.Keys + $userBloat.Keys | Sort-Object -Unique).Count
+    }
+
+    # Aggregate user counts from the flags hashtable
+    [int64]$usersWithRelevant = 0
+    [int64]$usersWithBloat    = 0
+    [int64]$usersOnlyRelevant = 0
+    [int64]$usersOnlyBloat    = 0
+    [int64]$usersBoth         = 0
+
+    foreach ($entry in $userFlags.Values) {
+        $hr = $entry.HasRelevant
+        $hb = $entry.HasBloat
+        if ($hr) { $usersWithRelevant++ }
+        if ($hb) { $usersWithBloat++ }
+        if ($hr -and $hb) { $usersBoth++ }
+        if ($hr -and -not $hb) { $usersOnlyRelevant++ }
+        if ($hb -and -not $hr) { $usersOnlyBloat++ }
+    }
+
+    $usersNoGroups = $TotalUsers - $userFlags.Count
+
+    Write-Log -Level "DEBUG" -Message "Local analysis: $($userFlags.Count) users processed, $($relevantGroupSet.Count) relevant groups, $($bloatGroupSet.Count) bloat groups"
 
     return [PSCustomObject]@{
         Patterns           = $Patterns
-        TotalGroups        = $totalGroups
+        TotalGroups        = $relevantGroups.Count + $bloatGroups.Count
         RelevantGroupCount = $relevantGroups.Count
         BloatGroupCount    = $bloatGroups.Count
         RelevantGroups     = $relevantGroups
@@ -1289,6 +1561,45 @@ function Get-RelevanceAnalysis {
         UsersOnlyBloat     = $usersOnlyBloat
         UsersBoth          = $usersBoth
         UsersNoGroups      = $usersNoGroups
+    }
+}
+
+<#
+.SYNOPSIS
+    Dispatcher for relevance analysis — selects SQL or local mode.
+
+.PARAMETER Patterns
+    String array of case-insensitive substring patterns.
+
+.PARAMETER TotalUsers
+    Total user count (for percentage calculations).
+
+.PARAMETER Mode
+    Analysis mode: "sql" pushes computation to Postgres, "local" does analysis
+    in PowerShell with hashtable-based lookups. Default: "local".
+
+.OUTPUTS
+    [PSCustomObject] with analysis results, or $null if no group data is found.
+#>
+function Get-RelevanceAnalysis {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Patterns,
+
+        [Parameter(Mandatory = $true)]
+        [int64]$TotalUsers,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("sql", "local")]
+        [string]$Mode = "local"
+    )
+
+    Write-Log -Level "INFO" -Message "Running relevance analysis in '$Mode' mode"
+
+    if ($Mode -eq "sql") {
+        return Get-RelevanceAnalysisSql -Patterns $Patterns -TotalUsers $TotalUsers
+    } else {
+        return Get-RelevanceAnalysisLocal -Patterns $Patterns -TotalUsers $TotalUsers
     }
 }
 
@@ -1401,13 +1712,29 @@ function Format-RelevanceAnalysis {
 }
 
 #===============================================================================
+# Progress Logging Helper
+#===============================================================================
+function Write-Progress-Step {
+    param(
+        [string]$StepName,
+        [int]$StepNumber,
+        [System.Diagnostics.Stopwatch]$Stopwatch
+    )
+    $elapsed = $Stopwatch.Elapsed.ToString("hh\:mm\:ss\.fff")
+    Write-Log -Level "INFO" -Message ("Step {0}: {1} (elapsed: {2})" -f $StepNumber, $StepName, $elapsed)
+}
+
+#===============================================================================
 # Main Script
 #===============================================================================
 function Main {
     $cfg = $script:QSRConfig
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $stepNum = 0
 
     Write-Log -Level "INFO" -Message "Starting Qlik Sense Repository - User Group Memberships"
     Write-Log -Level "INFO" -Message "Detail Level: $DetailLevel"
+    Write-Log -Level "INFO" -Message "Analysis Mode: $AnalysisMode"
 
     # Validate psql exists
     Write-Log -Level "INFO" -Message "Checking for psql binary"
@@ -1429,6 +1756,8 @@ function Main {
         }
     }
 
+    $stepNum++; Write-Progress-Step -StepName "Validated prerequisites" -StepNumber $stepNum -Stopwatch $sw
+
     # Test database connection
     if (-not (Test-DatabaseConnection)) {
         Write-Log -Level "ERROR" -Message "Cannot proceed without database connection"
@@ -1437,6 +1766,8 @@ function Main {
 
     # Check PostgreSQL version
     Test-PostgreSQLVersion | Out-Null
+
+    $stepNum++; Write-Progress-Step -StepName "Database connection verified" -StepNumber $stepNum -Stopwatch $sw
 
     # ---- Determine mode and build output ----
     $outputSections = @()
@@ -1490,17 +1821,25 @@ function Main {
             exit 1
         }
 
+        $stepNum++; Write-Progress-Step -StepName "Summary statistics retrieved" -StepNumber $stepNum -Stopwatch $sw
+
         $topUsers = Get-TopUsersByGroupCount -TopN $TopN
         if (-not $topUsers) { $topUsers = @() }
 
         $topGroups = Get-TopGroupsByUserCount -TopN $TopN
         if (-not $topGroups) { $topGroups = @() }
 
+        $stepNum++; Write-Progress-Step -StepName "Top users/groups retrieved" -StepNumber $stepNum -Stopwatch $sw
+
         $distribution = Get-GroupCountDistribution
         if (-not $distribution) { $distribution = @() }
 
+        $stepNum++; Write-Progress-Step -StepName "Distribution retrieved" -StepNumber $stepNum -Stopwatch $sw
+
         $tableSizes = Get-TableSizeInfo
         if (-not $tableSizes) { $tableSizes = @() }
+
+        $stepNum++; Write-Progress-Step -StepName "Table sizes retrieved" -StepNumber $stepNum -Stopwatch $sw
 
         $outputSections += Format-GroupMembershipSummary `
             -Summary $summary `
@@ -1510,20 +1849,26 @@ function Main {
             -TableSizes $tableSizes `
             -TopN $TopN
 
+        $stepNum++; Write-Progress-Step -StepName "Summary formatted" -StepNumber $stepNum -Stopwatch $sw
+
         # Relevance analysis (if -RelevantGroups specified)
         # Normalize: split comma-separated values so 'admin,sense' becomes two patterns
         $normalizedPatterns = @($RelevantGroups | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_.Trim() })
         if ($normalizedPatterns.Count -gt 0) {
-            Write-Log -Level "INFO" -Message "Running relevance analysis"
-            $allMembershipRows = Get-AllGroupMembershipRows
-            if ($allMembershipRows -and $allMembershipRows.Count -gt 0) {
-                $analysis = Get-RelevanceAnalysis `
-                    -AllRows $allMembershipRows `
-                    -Patterns $normalizedPatterns `
-                    -TotalUsers $summary.TotalUsers
+            $stepNum++; Write-Progress-Step -StepName "Relevance analysis started (mode: $AnalysisMode)" -StepNumber $stepNum -Stopwatch $sw
+
+            Write-Log -Level "INFO" -Message "Running relevance analysis (mode: $AnalysisMode)"
+            $analysis = Get-RelevanceAnalysis `
+                -Patterns $normalizedPatterns `
+                -TotalUsers $summary.TotalUsers `
+                -Mode $AnalysisMode
+
+            $stepNum++; Write-Progress-Step -StepName "Relevance analysis completed (mode: $AnalysisMode)" -StepNumber $stepNum -Stopwatch $sw
+
+            if ($analysis) {
                 $outputSections += Format-RelevanceAnalysis -Analysis $analysis
             } else {
-                Write-Log -Level "WARN" -Message "No group membership rows found for relevance analysis"
+                Write-Log -Level "WARN" -Message "No group data found for relevance analysis"
             }
         }
 
@@ -1538,6 +1883,8 @@ function Main {
             $allGroups = Get-AllGroupsWithUserCounts
             if (-not $allGroups) { $allGroups = @() }
             $outputSections += Format-GroupList -Groups $allGroups
+
+            $stepNum++; Write-Progress-Step -StepName "Details mode: user/group lists retrieved" -StepNumber $stepNum -Stopwatch $sw
         }
     }
 
@@ -1558,7 +1905,11 @@ function Main {
         Export-Output -Content $fullOutput -Filename $filenameWithTimestamp | Out-Null
     }
 
-    Write-Log -Level "INFO" -Message "User Group Memberships report completed successfully"
+    $stepNum++; Write-Progress-Step -StepName "Output written" -StepNumber $stepNum -Stopwatch $sw
+
+    $sw.Stop()
+    $totalElapsed = $sw.Elapsed.ToString("hh\:mm\:ss\.fff")
+    Write-Log -Level "INFO" -Message "User Group Memberships report completed successfully (total elapsed: $totalElapsed)"
     exit 0
 }
 

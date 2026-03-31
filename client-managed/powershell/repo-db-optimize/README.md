@@ -126,6 +126,7 @@ Analyses user group memberships in the repository database. Shows summary statis
 | `-FilterUser` | *(none)* | Detail view for one user (`DOMAIN\userId`) |
 | `-FilterGroup` | *(none)* | Detail view for one group (exact match) |
 | `-RelevantGroups` | *(none)* | Comma-separated or repeated substring patterns for bloat analysis |
+| `-AnalysisMode` | `local` | `local` (analyse in PowerShell) or `sql` (analyse in PostgreSQL) |
 | `-TopN` | `10` | Number of entries in top-N rankings |
 | `-OutputFile` | *(none)* | Write report to a timestamped file |
 | `-StepDebug` | *(off)* | Pause and inspect output after each stage |
